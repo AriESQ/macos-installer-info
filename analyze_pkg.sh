@@ -56,11 +56,17 @@ echo "   $FILE_TYPE"
 echo "   Input kind: $INPUT_KIND pkg"
 echo ""
 
+stage_start() { STAGE_T0=$SECONDS; }
+stage_end()   { echo "   ⏱  $((SECONDS - STAGE_T0))s"; }
+
 echo "🔐 Signature Status:"
+stage_start
 pkgutil --check-signature "$PKG" 2>&1 | head -10
+stage_end
 echo ""
 
 echo "📂 Expanding package for analysis..."
+stage_start
 if [ "$INPUT_KIND" = "bundle" ]; then
     # Bundle pkgs are already an expanded tree on disk; copy so the rest of the script
     # can treat it identically to a `pkgutil --expand` output.
@@ -73,12 +79,14 @@ else
     fi
 fi
 echo "   → Expanded to: $ANALYSIS_DIR"
+stage_end
 echo ""
 
 # Distribution XML — parse with xmllint, not grep.
 HAS_DISTRIBUTION=false
 DIST_ARCH=""
 echo "🏗️  Architecture Configuration:"
+stage_start
 if [ -f "$ANALYSIS_DIR/Distribution" ]; then
     HAS_DISTRIBUTION=true
     DIST_ARCH=$(xmllint --xpath 'string(//options/@hostArchitectures)' "$ANALYSIS_DIR/Distribution" 2>/dev/null || true)
@@ -96,6 +104,7 @@ if [ -f "$ANALYSIS_DIR/Distribution" ]; then
 else
     echo "   ℹ️  No Distribution file (single-component package)"
 fi
+stage_end
 echo ""
 
 # Per-component extraction with format dispatch.
@@ -161,6 +170,7 @@ postflight_has_network_primitive() {
 }
 
 echo "📦 Extracting payloads..."
+stage_start
 shopt -s nullglob
 for component in */; do
     component="${component%/}"
@@ -180,6 +190,7 @@ for component in */; do
     popd >/dev/null
 done
 shopt -u nullglob
+stage_end
 echo ""
 
 if [ ${#PAYLOAD_NOTES[@]} -gt 0 ]; then
@@ -193,17 +204,36 @@ fi
 # Stub/downloader detection: component with no Payload extraction artifacts AND
 # postflight that calls network primitives.
 echo "🕸️  Stub/downloader scan:"
+stage_start
 for component in "${COMPONENTS[@]}"; do
-    # Count Mach-O files and staged archives under this component.
-    macho_count=0
-    staged_count=0
+    # Short-circuit: a stub component has NO Mach-O and NO staged archive.
+    # As soon as we see either, this component is not a stub — stop scanning.
+    has_macho=false
+    has_staged=false
     if [ -d "$component" ]; then
-        while IFS= read -r f; do
-            file "$f" 2>/dev/null | grep -q "Mach-O" && macho_count=$((macho_count+1))
-        done < <(find "$component" -type f \( ! -name 'PackageInfo' ! -name 'Bom' ! -name 'Payload' \) 2>/dev/null)
-        staged_count=$(find "$component" -type f \( -name '*.tgz' -o -name '*.tar.gz' -o -name '*.zip' -o -name '*.pkg' -o -name '*.dmg' \) 2>/dev/null | wc -l | tr -d ' ')
+        echo "   scanning $(basename "$component")..."
+        if find "$component" -type f \( -name '*.tgz' -o -name '*.tar.gz' -o -name '*.zip' -o -name '*.pkg' -o -name '*.dmg' \) 2>/dev/null | grep -q .; then
+            has_staged=true
+        fi
+        if ! $has_staged; then
+            total=$(find "$component" -type f \( ! -name 'PackageInfo' ! -name 'Bom' ! -name 'Payload' \) 2>/dev/null | wc -l | tr -d ' ')
+            i=0
+            while IFS= read -r f; do
+                i=$((i+1))
+                if [ $((i % 200)) -eq 0 ]; then
+                    printf '\r      %d / %d files checked' "$i" "$total" >&2
+                fi
+                if file "$f" 2>/dev/null | grep -q "Mach-O"; then
+                    has_macho=true
+                    break
+                fi
+            done < <(find "$component" -type f \( ! -name 'PackageInfo' ! -name 'Bom' ! -name 'Payload' \) 2>/dev/null)
+            if [ "$total" -ge 200 ]; then
+                printf '\r      %d / %d files checked\n' "$i" "$total" >&2
+            fi
+        fi
     fi
-    if [ "$macho_count" -eq 0 ] && [ "$staged_count" -eq 0 ]; then
+    if ! $has_macho && ! $has_staged; then
         net_hit=$(postflight_has_network_primitive "$component/Scripts" || true)
         if [ -n "$net_hit" ]; then
             STUB_COMPONENTS+=("$component")
@@ -216,11 +246,13 @@ done
 if [ ${#STUB_COMPONENTS[@]} -eq 0 ]; then
     echo "   (none detected)"
 fi
+stage_end
 echo ""
 
 # Recursive Mach-O walk: collect arch info across every Mach-O on disk,
 # not just main app executables.
 echo "🔬 Binary Architecture Analysis:"
+stage_start
 
 MAIN_EXEC_HAS_NATIVE=false   # any main .app exec ships arm64/arm64e
 MAIN_EXEC_HAS_X86=false
@@ -268,11 +300,20 @@ while IFS= read -r app; do
     [ -n "$MIN_OS" ] && echo "      Minimum macOS: $MIN_OS"
 done < <(find "$ANALYSIS_DIR" -name '*.app' -type d 2>/dev/null)
 
+stage_end
 echo ""
 echo "🔎 Helper / dylib / XPC architecture sweep:"
+stage_start
 # Walk every Mach-O file, regardless of +x bit. Count Intel-only ones —
 # they're the legitimate-Rosetta signal even when the main exec is universal.
+sweep_total=$(find "$ANALYSIS_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+echo "   scanning $sweep_total files..."
+sweep_i=0
 while IFS= read -r f; do
+    sweep_i=$((sweep_i+1))
+    if [ $((sweep_i % 200)) -eq 0 ]; then
+        printf '\r      %d / %d files checked' "$sweep_i" "$sweep_total" >&2
+    fi
     [ -f "$f" ] || continue
     if file -b "$f" 2>/dev/null | grep -q "Mach-O"; then
         archs=$(lipo -archs "$f" 2>/dev/null || true)
@@ -284,6 +325,9 @@ while IFS= read -r f; do
         fi
     fi
 done < <(find "$ANALYSIS_DIR" -type f 2>/dev/null)
+if [ "$sweep_total" -ge 200 ]; then
+    printf '\r      %d / %d files checked\n' "$sweep_i" "$sweep_total" >&2
+fi
 
 echo "   Intel-only Mach-O files (dylibs/XPC/helpers): $HELPER_INTEL_ONLY_COUNT"
 if [ "$HELPER_INTEL_ONLY_COUNT" -gt 0 ]; then
@@ -291,6 +335,7 @@ if [ "$HELPER_INTEL_ONLY_COUNT" -gt 0 ]; then
     [ "$HELPER_INTEL_ONLY_COUNT" -gt 10 ] && echo "      … and $((HELPER_INTEL_ONLY_COUNT - 10)) more"
 fi
 $ANY_ARM64E && echo "   ℹ️  arm64e slice present (Apple pointer-authentication ABI — native on Apple Silicon)"
+stage_end
 echo ""
 
 # Summary.
