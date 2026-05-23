@@ -342,6 +342,63 @@ defaults read YourApp.app/Contents/Info.plist NSLocationUsageDescription
 - `NSPhotoLibraryUsageDescription` - Photos access
 - `NSAppleEventsUsageDescription` - Automation/AppleScript
 
+### #012 - Gatekeeper Assessment (spctl)
+```bash
+# Check if macOS Gatekeeper will allow the app to run
+spctl -a -vv YourApp.app
+
+# Or for a PKG installer before extracting
+spctl -a -vv -t install YourInstaller.pkg
+```
+
+**What this reveals:**
+- Will macOS allow this to run without a security warning?
+- Notarization status
+- Origin (App Store, identified developer, unknown)
+
+**Example outputs:**
+```bash
+# ✅ Approved and notarized
+YourApp.app: accepted
+source=Notarized Developer ID
+origin=Developer ID Application: Company Name (TEAM123456)
+
+# ⚠️ Not notarized
+YourApp.app: rejected
+source=no usable signature
+
+# ❌ Unsigned
+YourApp.app: rejected
+source=unnotarized
+```
+
+### #013 - VirusTotal Sandbox Analysis
+
+VirusTotal provides free automated sandbox analysis that shows you what an installer actually does when it runs. This is invaluable for understanding behavior before installing on your own machine.
+
+**What VirusTotal's sandbox reveals (Behavior tab):**
+- File system changes the installer makes
+- Network connections attempted
+- Processes spawned during installation
+- Registry/plist modifications
+- System calls and API usage
+- Screenshots of the installation process
+
+**How to use:**
+1. Visit https://www.virustotal.com
+2. Upload your PKG or APP file (or provide URL)
+3. Wait for analysis to complete (may take a few minutes)
+4. Click the **Behavior** tab to see sandbox execution results
+5. Check **Relations** tab for bundled files and network activity
+6. Read **Community** comments for known issues or warnings
+
+**Important Privacy Note:**
+- Uploading makes the file available to VirusTotal's partners
+- Don't upload confidential or proprietary software
+- Consider this public disclosure
+
+**Tip:** The Behavior tab shows you exactly what the installer does in a controlled environment - what files it touches, what network requests it makes, what processes it spawns. This is far more valuable than just the detection results.
+
 ---
 
 ## Common Issues and Solutions
@@ -555,6 +612,10 @@ plutil -p /path/to/app/Contents/Info.plist
 
 # #020 - Check privacy permissions
 defaults read /path/to/app/Contents/Info.plist | grep UsageDescription
+
+# #026 - Gatekeeper assessment
+spctl -a -vv /path/to/app
+spctl -a -vv -t install /path/to/installer.pkg
 ```
 
 ---
@@ -564,19 +625,24 @@ defaults read /path/to/app/Contents/Info.plist | grep UsageDescription
 - [Apple Developer: Distribution Definition Reference](https://developer.apple.com/library/archive/documentation/DeveloperTools/Reference/DistributionDefinitionRef/)
 - [Building Universal macOS Binaries](https://developer.apple.com/documentation/xcode/building-a-universal-macos-binary)
 - [Scripting OS X: Platform Support in Installer Packages](https://scriptingosx.com/2020/12/platform-support-in-macos-installer-packages-pkg/)
+- [VirusTotal](https://www.virustotal.com) - Free sandbox analysis showing installer behavior (Behavior tab)
 
 ---
 
 ## Troubleshooting Checklist
 
-- [ ] Package signature is valid
+- [ ] Package signature is valid (`pkgutil --check-signature`)
+- [ ] Gatekeeper will allow execution (`spctl -a -vv`)
 - [ ] Distribution XML contains `hostArchitectures="x86_64,arm64"`
-- [ ] All binaries are universal or arm64-native
+- [ ] All binaries are universal or arm64-native (`lipo -archs`)
 - [ ] Info.plist doesn't force Intel architecture
 - [ ] No Intel-only frameworks or plugins
 - [ ] Scripts (if any) have proper `LSArchitecturePriority` set
+- [ ] Code signature includes appropriate entitlements (`codesign -d --entitlements`)
+- [ ] Privacy permissions are declared and reasonable
+- [ ] Notarization status verified (if distributing outside App Store)
 
 ---
 
 **Last Updated:** 2026-05-23  
-**Version:** 1.1 (Stage 1 hardening: recipes #021–#025)
+**Version:** 1.2 (Stage 1 hardening: recipes #021–#025; Gatekeeper #012 + VirusTotal #013)
