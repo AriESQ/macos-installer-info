@@ -306,34 +306,43 @@ echo "🔎 Helper / dylib / XPC architecture sweep:"
 stage_start
 # Walk every Mach-O file, regardless of +x bit. Count Intel-only ones —
 # they're the legitimate-Rosetta signal even when the main exec is universal.
+#
+# Classify in a SINGLE `file` pass over all paths (one process parses the magic
+# DB once) instead of spawning `file` per file, then `lipo` only the Mach-O hits.
+# `-F` gives each record as `path<SEP>description`; universal binaries emit extra
+# "(for architecture …)" continuation lines that use the default ':' separator
+# and therefore lack our SEP — we skip any line without it.
 sweep_total=$(find "$ANALYSIS_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
-echo "   scanning $sweep_total files..."
-sweep_i=0
-while IFS= read -r f; do
-    sweep_i=$((sweep_i+1))
-    if [ $((sweep_i % 200)) -eq 0 ]; then
-        printf '\r      %d / %d files checked' "$sweep_i" "$sweep_total" >&2
+echo "   scanning $sweep_total files (single file pass)..."
+SEP='@@FILEMAGIC@@'
+macho_paths=()
+while IFS= read -r line; do
+    case "$line" in
+        *"$SEP"*) ;;        # real record
+        *) continue ;;      # continuation line (per-arch detail) — skip
+    esac
+    desc=${line#*"$SEP"}
+    case "$desc" in
+        *Mach-O*) macho_paths+=("${line%%"$SEP"*}") ;;
+    esac
+done < <(find "$ANALYSIS_DIR" -type f -print0 2>/dev/null | xargs -0 -r file -F "$SEP" 2>/dev/null)
+
+echo "   ${#macho_paths[@]} Mach-O file(s) found; reading architectures..."
+for f in "${macho_paths[@]}"; do
+    archs=$(lipo -archs "$f" 2>/dev/null || true)
+    [ -z "$archs" ] && continue
+    echo "$archs" | grep -qE '\barm64e\b' && ANY_ARM64E=true
+    if echo "$archs" | grep -qE '\bx86_64\b' && ! echo "$archs" | grep -qE '\barm64(e)?\b'; then
+        HELPER_INTEL_ONLY_COUNT=$((HELPER_INTEL_ONLY_COUNT+1))
+        HELPER_INTEL_ONLY_LIST+=("${f#$ANALYSIS_DIR/}")
     fi
-    [ -f "$f" ] || continue
-    if file -b "$f" 2>/dev/null | grep -q "Mach-O"; then
-        archs=$(lipo -archs "$f" 2>/dev/null || true)
-        [ -z "$archs" ] && continue
-        echo "$archs" | grep -qE '\barm64e\b' && ANY_ARM64E=true
-        if echo "$archs" | grep -qE '\bx86_64\b' && ! echo "$archs" | grep -qE '\barm64(e)?\b'; then
-            HELPER_INTEL_ONLY_COUNT=$((HELPER_INTEL_ONLY_COUNT+1))
-            HELPER_INTEL_ONLY_LIST+=("${f#$ANALYSIS_DIR/}")
-        fi
-    fi
-done < <(find "$ANALYSIS_DIR" -type f 2>/dev/null)
-if [ "$sweep_total" -ge 200 ]; then
-    printf '\r      %d / %d files checked\n' "$sweep_i" "$sweep_total" >&2
-fi
+done
 
 echo "   Intel-only Mach-O files (dylibs/XPC/helpers): $HELPER_INTEL_ONLY_COUNT"
-if [ "$HELPER_INTEL_ONLY_COUNT" -gt 0 ]; then
-    printf '      - %s\n' "${HELPER_INTEL_ONLY_LIST[@]:0:10}"
-    [ "$HELPER_INTEL_ONLY_COUNT" -gt 10 ] && echo "      … and $((HELPER_INTEL_ONLY_COUNT - 10)) more"
+if ((${#HELPER_INTEL_ONLY_LIST[@]} > 0)); then
+    printf '      - %s\n' "${HELPER_INTEL_ONLY_LIST[@]}"
 fi
+
 $ANY_ARM64E && echo "   ℹ️  arm64e slice present (Apple pointer-authentication ABI — native on Apple Silicon)"
 stage_end
 echo ""
