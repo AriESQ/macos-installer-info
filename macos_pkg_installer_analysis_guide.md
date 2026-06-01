@@ -555,6 +555,98 @@ When any component is classified as a stub, the final summary block must flip in
 
 ---
 
+## App Bundle Analysis Recipes (added 2026-05-31)
+
+These recipes cover drag-to-install `.app` bundles (e.g. the `.app` inside a `.dmg`) rather than `.pkg` installers. They are implemented by the companion `analyze_app.sh` script and continue the numbered-recipe convention. The focus is the same — diagnosing Rosetta 2 prompts on Apple Silicon — but at the bundle level instead of the installer level.
+
+### #027 - Detect a `.app` Bundle and Dispatch
+
+A `.app` is a directory ending in `.app` containing `Contents/Info.plist`. Distinguish it from the installer types so you route to the right analyzer, and give `.dmg` a mount hint:
+
+```bash
+case "$INPUT" in
+    *.pkg) echo "installer — use analyze_pkg.sh" ;;
+    *.dmg) echo "mount first: hdiutil attach \"$INPUT\"" ;;
+    *)     [ -f "$INPUT/Contents/Info.plist" ] && echo "app bundle" ;;
+esac
+```
+
+### #028 - Resolve a Launcher-Stub `CFBundleExecutable`
+
+`CFBundleExecutable` is not always a Mach-O. Some apps point it at a shell script that re-execs the real binary elsewhere in the bundle (Nuvotion4's `Contents/MacOS/Nuvotion4` is a bash stub that `cd`s to `../Resources/bin` and `exec`s the real binary). Detect the stub and resolve what it actually runs:
+
+```bash
+exec_name=$(defaults read "$APP/Contents/Info" CFBundleExecutable)
+main="$APP/Contents/MacOS/$exec_name"
+if ! file -b "$main" | grep -q "Mach-O"; then
+    tgt=$(grep -oE 'exec[[:space:]]+[^ "]+' "$main" | head -1 | awk '{print $2}')
+    find "$APP" -type f -name "$(basename "${tgt#./}")" | while read -r c; do
+        file -b "$c" | grep -q "Mach-O" && { lipo -archs "$c"; break; }
+    done
+fi
+```
+
+### #029 - Script as `CFBundleExecutable` Is Itself a Rosetta Trigger
+
+This is the subtle one. Before launch, macOS/LaunchServices inspects **only** `Contents/MacOS/<CFBundleExecutable>` for a native arm64 slice. A shell script has no slices, so LaunchServices concludes the app cannot run natively and prompts to install/use Rosetta — even when the real binary (and every dylib) is arm64-native. Observed on an all-arm64 app: 84 Mach-O objects, 0 Intel-only, yet a "you need to install Rosetta" prompt. The fix is the developer's: `CFBundleExecutable` must be a real arm64/universal Mach-O (point it at the binary directly, or ship a *compiled* trampoline — never a script).
+
+```bash
+# Red flag: bundle is all-arm64 yet prompts for Rosetta.
+file -b "$APP/Contents/MacOS/$(defaults read "$APP/Contents/Info" CFBundleExecutable)" \
+    | grep -qi 'script' && echo "script as bundle exec → false Rosetta prompt"
+```
+
+### #030 - Deep Mach-O Sweep for a Missing arm64 Slice
+
+An arm64 main binary is not sufficient: the app still falls into Rosetta if it loads (or relaunches into) an x86_64-only dependency — a framework, vendored `.dylib`, native Node addon (`.node`), Python C-extension (`.so`), XPC service, or `.bundle` plug-in. Sweep the whole bundle (this reuses the arm64e-equivalence logic of recipe #023):
+
+```bash
+find "$APP" -type f | while read -r f; do
+    file -b "$f" | grep -q "Mach-O" || continue
+    archs=$(lipo -archs "$f" 2>/dev/null)
+    echo "$archs" | grep -qE '\barm64(e)?\b' || echo "x86_64-only: ${f#"$APP"/}"
+done
+```
+
+### #031 - Runtime Rosetta Triggers (arch forcing + LaunchServices override)
+
+When a bundle is all-arm64 yet still prompts, the cause is usually outside the static arch data. Two checks catch the common cases:
+
+```bash
+# Explicit translation forcing in any bundled script:
+grep -RInE 'arch[[:space:]]+(-arch[[:space:]]+)?x86_64' "$APP"
+
+# Per-user "Open using Rosetta" override (Get Info), stored in LaunchServices:
+LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+"$LSREG" -dump | grep -F -A 25 "$APP" | grep -iE 'arch|rosetta|translated'
+```
+
+The Get Info override is per-user state, not part of the `.app`; clear it in Finder → Get Info → uncheck "Open using Rosetta". Causes still invisible to static analysis include Intel helpers downloaded at runtime and a `dlopen` that relaunches the process under Rosetta when an arch-matched library is missing.
+
+---
+
+## Complete App Bundle Analysis Script
+
+See [`analyze_app.sh`](analyze_app.sh) — the companion to `analyze_pkg.sh` for `.app` bundles. It runs through these phases:
+
+1. Input validation + dispatch (`.pkg`/`.dmg` redirects, recipe #027)
+2. Bundle identity & arch hints (`Info.plist`: `LSArchitecturePriority`, `LSRequiresNativeExecution`)
+3. Main executable — Mach-O vs launcher-stub resolution (recipes #028, #029)
+4. Code signature + entitlements (`codesign -d -vv --entitlements -`)
+5. Deep Mach-O sweep for missing arm64 (recipe #030)
+6. Runtime Rosetta triggers — `arch -x86_64` forcing + LaunchServices override (recipe #031)
+7. Summary — branches on launcher-stub vs Mach-O main, native vs Intel-only, and the script-as-exec root cause
+
+Usage:
+```bash
+chmod +x analyze_app.sh
+./analyze_app.sh /path/to/Some.app
+```
+
+The script writes a full Mach-O sweep to `/tmp/app_analysis_<epoch>.txt` and prints a cleanup hint at the end (it does not auto-clean).
+
+---
+
 ## Complete Analysis Script
 
 See [`analyze_pkg.sh`](analyze_pkg.sh) — the canonical implementation. It runs through these phases:
@@ -616,6 +708,19 @@ defaults read /path/to/app/Contents/Info.plist | grep UsageDescription
 # #026 - Gatekeeper assessment
 spctl -a -vv /path/to/app
 spctl -a -vv -t install /path/to/installer.pkg
+
+# #027 - Is this a .app bundle?
+[ -f /path/to/App.app/Contents/Info.plist ] && echo "app bundle"
+
+# #029 - Is the bundle exec a script? (false Rosetta prompt)
+file -b /path/to/App.app/Contents/MacOS/"$(defaults read /path/to/App.app/Contents/Info CFBundleExecutable)"
+
+# #031 - Find explicit Rosetta forcing in a bundle
+grep -RInE 'arch +(-arch +)?x86_64' /path/to/App.app
+
+# === Full automated analysis ===
+# ./analyze_pkg.sh Installer.pkg   # .pkg installers
+# ./analyze_app.sh App.app         # .app bundles
 ```
 
 ---
@@ -644,5 +749,5 @@ spctl -a -vv -t install /path/to/installer.pkg
 
 ---
 
-**Last Updated:** 2026-05-23  
-**Version:** 1.2 (Stage 1 hardening: recipes #021–#025; Gatekeeper #012 + VirusTotal #013)
+**Last Updated:** 2026-05-31  
+**Version:** 1.3 (App bundle analysis: `analyze_app.sh` + recipes #027–#031; Stage 1 hardening #021–#025; Gatekeeper #012 + VirusTotal #013)
