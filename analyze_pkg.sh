@@ -7,7 +7,10 @@
 set -uo pipefail
 
 PKG="${1:-}"
-ANALYSIS_DIR="/tmp/pkg_analysis_$(date +%s)"
+# $$ as well as the timestamp: `date +%s` has one-second granularity, so two
+# analyses started in the same second would collide — and pkgutil --expand
+# refuses to write into a directory that already exists, aborting the run.
+ANALYSIS_DIR="/tmp/pkg_analysis_$(date +%s)_$$"
 
 if [ -z "$PKG" ]; then
     echo "Usage: $0 <path-to-installer.pkg>"
