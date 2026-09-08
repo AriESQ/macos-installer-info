@@ -369,6 +369,7 @@ MAIN_EXEC_HAS_NATIVE=false   # any main .app exec ships arm64/arm64e
 MAIN_EXEC_HAS_X86=false
 HELPER_INTEL_ONLY_COUNT=0    # count of Mach-O files (any kind) that are x86_64-only
 HELPER_INTEL_ONLY_LIST=()
+KEXT_INTEL_ONLY_LIST=()      # x86_64-only kexts/dexts — Rosetta cannot help these
 ANY_ARM64E=false
 
 while IFS= read -r app; do
@@ -444,11 +445,26 @@ for f in "${macho_paths[@]}"; do
     [ -z "$archs" ] && continue
     echo "$archs" | grep -qE '\barm64e\b' && ANY_ARM64E=true
     if echo "$archs" | grep -qE '\bx86_64\b' && ! echo "$archs" | grep -qE '\barm64(e)?\b'; then
-        HELPER_INTEL_ONLY_COUNT=$((HELPER_INTEL_ONLY_COUNT+1))
-        HELPER_INTEL_ONLY_LIST+=("${f#$ANALYSIS_DIR/}")
+        rel="${f#$ANALYSIS_DIR/}"
+        case "$rel" in
+            *.kext/*|*.dext/*)
+                # Rosetta 2 translates user-space processes only. An Intel-only
+                # kext or DriverKit driver cannot load on Apple Silicon at all,
+                # so it does not belong in the "Rosetta will be invoked" count.
+                KEXT_INTEL_ONLY_LIST+=("$rel")
+                ;;
+            *)
+                HELPER_INTEL_ONLY_COUNT=$((HELPER_INTEL_ONLY_COUNT+1))
+                HELPER_INTEL_ONLY_LIST+=("$rel")
+                ;;
+        esac
     fi
 done
 
+if ((${#KEXT_INTEL_ONLY_LIST[@]} > 0)); then
+    echo "   🔴 Intel-only kernel extensions / DriverKit drivers: ${#KEXT_INTEL_ONLY_LIST[@]}"
+    printf '      - %s\n' "${KEXT_INTEL_ONLY_LIST[@]}"
+fi
 echo "   Intel-only Mach-O files (dylibs/XPC/helpers): $HELPER_INTEL_ONLY_COUNT"
 if ((${#HELPER_INTEL_ONLY_LIST[@]} > 0)); then
     printf '      - %s\n' "${HELPER_INTEL_ONLY_LIST[@]}"
@@ -462,6 +478,19 @@ echo ""
 echo "═══════════════════════════════════════════════════"
 echo "📊 Summary & Recommendations"
 echo "═══════════════════════════════════════════════════"
+
+# An Intel-only kext outranks everything else here: no Rosetta advice applies,
+# and the affected hardware simply does not work. Lead with it.
+if [ ${#KEXT_INTEL_ONLY_LIST[@]} -gt 0 ]; then
+    echo "🔴 INTEL-ONLY KERNEL EXTENSION(S) — CANNOT RUN ON APPLE SILICON"
+    for k in "${KEXT_INTEL_ONLY_LIST[@]}"; do echo "      - $k"; done
+    echo ""
+    echo "   Rosetta 2 translates user-space processes only; it does not translate"
+    echo "   kernel extensions or DriverKit drivers. Installing Rosetta will NOT help."
+    echo "   The associated hardware or feature is unusable on Apple Silicon until the"
+    echo "   vendor ships a native arm64 kext or a DriverKit .dext replacement."
+    echo ""
+fi
 
 # A staged archive we could not open is an unanalyzed corner of the installer.
 # Say so up front — the verdict below is silent about whatever is inside it.
