@@ -169,6 +169,98 @@ postflight_has_network_primitive() {
         "$scripts_dir" 2>/dev/null | head -1
 }
 
+# Staged prereq archives.
+#
+# Some components install nothing directly; they drop an archive into
+# .../Prereqs/ for a postflight script to unpack later. The binaries inside are
+# invisible to the sweep below unless we expand them here, and they can hold the
+# most severe finding in the whole installer — DaVinci Resolve 21.0.4 stages a
+# zip whose only two Mach-O objects are Intel-only, one of them a kext.
+#
+# Expanded next to the archive as <archive>.expanded/ so everything lands under
+# $ANALYSIS_DIR and the existing sweep picks it up with no further plumbing.
+STAGED_EXPANDED=()      # archives expanded successfully
+STAGED_SKIPPED=()       # archives found but not expanded, with reason
+
+# Archives above this size are reported and skipped rather than expanded.
+MAX_STAGED_MB="${MAX_STAGED_MB:-2048}"
+STAGED_MAX_DEPTH=3      # archive → archive → archive; deep enough for real pkgs
+
+expand_staged_archive() {
+    # $1: archive path (relative to $ANALYSIS_DIR)  $2: component label
+    # $3: current depth
+    local archive="$1" component="$2" depth="$3"
+    local dest="${archive}.expanded"
+    local size_mb inner
+
+    size_mb=$(( $(stat -f%z "$archive" 2>/dev/null || echo 0) / 1048576 ))
+    if [ "$size_mb" -gt "$MAX_STAGED_MB" ]; then
+        STAGED_SKIPPED+=("$archive (${size_mb}MB exceeds ${MAX_STAGED_MB}MB cap — set MAX_STAGED_MB to override)")
+        return 1
+    fi
+
+    case "$archive" in
+        *.dmg)
+            # hdiutil attach mutates system state and can prompt for a licence
+            # agreement; refuse rather than surprise the user mid-analysis.
+            STAGED_SKIPPED+=("$archive (disk image — mount with 'hdiutil attach' and re-run against its contents)")
+            return 1
+            ;;
+        *.tgz|*.tar.gz|*.tar)
+            mkdir -p "$dest" || return 1
+            if ! tar xf "$archive" -C "$dest" 2>/dev/null; then
+                STAGED_SKIPPED+=("$archive (tar extraction failed)")
+                return 1
+            fi
+            ;;
+        *.zip)
+            mkdir -p "$dest" || return 1
+            if ! unzip -oq "$archive" -d "$dest" 2>/dev/null; then
+                STAGED_SKIPPED+=("$archive (unzip failed)")
+                return 1
+            fi
+            ;;
+        *.pkg)
+            # pkgutil insists on creating the destination itself.
+            if ! pkgutil --expand "$archive" "$dest" >/dev/null 2>&1; then
+                STAGED_SKIPPED+=("$archive (pkgutil --expand failed)")
+                return 1
+            fi
+            ;;
+        *)
+            STAGED_SKIPPED+=("$archive (unrecognised archive type)")
+            return 1
+            ;;
+    esac
+
+    STAGED_EXPANDED+=("$archive")
+
+    # A staged pkg has its own Payload (possibly several, one per component).
+    # Run them back through the same format dispatch used for the outer pkg.
+    while IFS= read -r inner; do
+        [ -f "$inner/Payload" ] || continue
+        ( cd "$inner" && extract_payload "$component → $(basename "$inner")" ) >/dev/null 2>&1 || true
+    done < <(
+        [ -f "$dest/Payload" ] && echo "$dest"
+        find "$dest" -maxdepth 2 -type d -name '*.pkg' 2>/dev/null
+    )
+
+    # Recurse: staged tarballs routinely contain a pkg, which contains a Payload.
+    expand_staged_tree "$dest" "$component" $((depth + 1))
+    return 0
+}
+
+expand_staged_tree() {
+    # $1: directory to scan  $2: component label  $3: current depth
+    local dir="$1" component="$2" depth="$3" archive
+    [ "$depth" -gt "$STAGED_MAX_DEPTH" ] && return 0
+    while IFS= read -r archive; do
+        expand_staged_archive "$archive" "$component" "$depth" || true
+    done < <(find "$dir" -type f \
+        \( -name '*.tgz' -o -name '*.tar.gz' -o -name '*.tar' \
+           -o -name '*.zip' -o -name '*.pkg' -o -name '*.dmg' \) 2>/dev/null)
+}
+
 echo "📦 Extracting payloads..."
 stage_start
 shopt -s nullglob
@@ -200,6 +292,25 @@ if [ ${#PAYLOAD_NOTES[@]} -gt 0 ]; then
     done
     echo ""
 fi
+
+# Expand staged prereq archives so their contents reach the sweep below.
+echo "🎁 Staged prereq archives:"
+stage_start
+for component in "${COMPONENTS[@]}"; do
+    expand_staged_tree "$component" "$component" 1
+done
+if [ ${#STAGED_EXPANDED[@]} -eq 0 ] && [ ${#STAGED_SKIPPED[@]} -eq 0 ]; then
+    echo "   (none found)"
+else
+    for a in "${STAGED_EXPANDED[@]}"; do
+        echo "   ✅ expanded: $a"
+    done
+    for a in "${STAGED_SKIPPED[@]}"; do
+        echo "   ⚠️  skipped:  $a"
+    done
+fi
+stage_end
+echo ""
 
 # Stub/downloader detection: component with no Payload extraction artifacts AND
 # postflight that calls network primitives.
@@ -351,6 +462,15 @@ echo ""
 echo "═══════════════════════════════════════════════════"
 echo "📊 Summary & Recommendations"
 echo "═══════════════════════════════════════════════════"
+
+# A staged archive we could not open is an unanalyzed corner of the installer.
+# Say so up front — the verdict below is silent about whatever is inside it.
+if [ ${#STAGED_SKIPPED[@]} -gt 0 ]; then
+    echo "⚠️  ${#STAGED_SKIPPED[@]} staged prereq archive(s) were NOT analyzed:"
+    for a in "${STAGED_SKIPPED[@]}"; do echo "      - $a"; done
+    echo "   The verdict below does not account for their contents."
+    echo ""
+fi
 
 # Branch 1: stub installer → result is non-comprehensive, refuse a clean verdict.
 if [ ${#STUB_COMPONENTS[@]} -gt 0 ]; then
