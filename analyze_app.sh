@@ -207,7 +207,7 @@ echo ""
 # ----------------------------------------------------------------------------
 echo "🔬 Deep Mach-O Sweep:"
 stage_start
-SWEEP="/tmp/app_analysis_$(date +%s).txt"
+SWEEP="/tmp/app_analysis_$(date +%s)_$$.txt"   # $$ too: see analyze_pkg.sh
 : > "$SWEEP"
 
 MACHO_COUNT=0

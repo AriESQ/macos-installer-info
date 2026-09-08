@@ -23,11 +23,37 @@ install.
 |------|---------|
 | **`analyze_pkg.sh`** | End-to-end analyzer for `.pkg` **installers**. |
 | **`analyze_app.sh`** | End-to-end analyzer for `.app` **bundles** (e.g. the app inside a drag-to-install `.dmg`). |
-| **`macos_pkg_installer_analysis_guide.md`** | The long-form guide. Numbered recipes (`#001`…`#031`) document the underlying commands; the scripts automate what the guide explains. |
+| **`macos_pkg_installer_analysis_guide.md`** | The long-form guide. Numbered recipes (`#001`…`#034`) document the underlying commands; the scripts automate what the guide explains. |
+| **`tests/run_tests.sh`** | Regression tests for `analyze_pkg.sh`, run against synthetic fixtures. |
+| `analysis/<product>/` | Findings write-ups from real installers analyzed with these tools. |
 | `CLAUDE.md` | Repo guidance for AI agents working in this codebase. |
 
 The scripts and the guide are meant to **stay in sync** — each script phase has a
 counterpart recipe in the guide.
+
+---
+
+## Tests
+
+```bash
+./tests/run_tests.sh
+```
+
+Builds synthetic `.pkg` fixtures with `pkgbuild`/`productbuild` and asserts on
+the analyzer's output: an ordinary universal package, a package staging an
+archive that contains a kext plus inert and genuine Intel-only binaries, and a
+package staging a `.dmg` that must be refused rather than mounted.
+
+Fixtures are synthetic on purpose. Asserting exact counts requires choosing the
+architecture mix, and real installers are multi-GB and cannot be committed.
+
+The tests need `clang` to build `x86_64`-only and universal Mach-O fixtures —
+an Apple Silicon Mac ships no `x86_64` slice to thin out of its own binaries.
+If `clang` is missing the suite skips rather than fails; the analyzers
+themselves still depend on nothing but stock macOS tools.
+
+Set `KEEP_FIXTURES=1` to keep the generated packages and analyzer output for
+inspection.
 
 ---
 
