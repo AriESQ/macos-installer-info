@@ -623,6 +623,75 @@ LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchService
 
 The Get Info override is per-user state, not part of the `.app`; clear it in Finder → Get Info → uncheck "Open using Rosetta". Causes still invisible to static analysis include Intel helpers downloaded at runtime and a `dlopen` that relaunches the process under Rosetta when an arch-matched library is missing.
 
+### #032 - Expand Staged Prereq Archives
+
+A component that installs no binaries may still be hiding the worst finding in the package. The pattern: drop an archive into `/Library/Application Support/<vendor>/…/Prereqs/` and let a postflight script unpack it after the main install. Anything inside is invisible to a sweep of the extracted Payloads.
+
+DaVinci Resolve stages two such archives. One of them, `fairlight_audio_accelerator.zip`, contains exactly two Mach-O objects and both are Intel-only — including a kext (see #033).
+
+Expand them next to the original so a single sweep covers everything:
+
+```bash
+# Find staged archives among the extracted payloads:
+find "$WORK/expanded" -type f \
+  \( -name '*.tgz' -o -name '*.tar.gz' -o -name '*.zip' -o -name '*.pkg' -o -name '*.dmg' \)
+
+# Expand in place, then re-run the arch sweep over the whole tree:
+tar xf  staged.tgz -C staged.tgz.expanded
+unzip -oq staged.zip -d staged.zip.expanded
+pkgutil --expand staged.pkg staged.pkg.expanded
+```
+
+A staged `.pkg` has its own `Payload`, which needs the same format dispatch as the outer package (#021) — and a staged tarball routinely contains a `.pkg`, so expansion has to recurse. Cap the depth and the archive size.
+
+`.dmg` is best left alone: `hdiutil attach` mutates system state and can present a licence agreement. Report it and let the user mount it deliberately.
+
+**Report what you could not open.** A staged archive you skipped is an unanalyzed corner of the installer, and a clean verdict that silently excludes it is worse than no verdict.
+
+### #033 - Intel-Only Kexts and Dexts Are Not a Rosetta Problem
+
+Rosetta 2 translates user-space processes **only**. It does not translate kernel extensions or DriverKit drivers. An x86_64-only `.kext` therefore cannot load on Apple Silicon at all — the advice "install Rosetta" is simply wrong, and the affected hardware does not work at any speed.
+
+```bash
+# Intel-only Mach-O sitting inside a driver bundle:
+find "$EX" -type f -path '*.kext/*' -o -type f -path '*.dext/*' | while read -r f; do
+  file "$f" 2>/dev/null | grep -q Mach-O || continue
+  A=$(lipo -archs "$f" 2>/dev/null)
+  echo "$A" | grep -q x86_64 && ! echo "$A" | grep -q arm64 && echo "BLOCKED: $f [$A]"
+done
+```
+
+Grade these above every other Intel-only finding. The remedy is a native arm64 kext or a DriverKit `.dext` from the vendor; there is no user-side workaround.
+
+### #034 - Not Every Intel-Only Binary Costs You Rosetta
+
+Libraries that hand-optimise per instruction set ship several backends and choose one at load time. On Apple Silicon the x86 variants are never loaded — an x86_64-only dylib cannot be `dlopen`'d by an arm64 process in the first place — so counting them as Rosetta triggers overstates the problem.
+
+Two signals, catching different layouts:
+
+**A. The name carries an x86-exclusive ISA** (`AVX`, `AVX2`, `SSE`, `MMX`). No arm64 build of such a backend can exist, so no further evidence is needed:
+
+```
+BlackmagicRawAPI.framework/Versions/A/Libraries/
+  InstructionSetServicesAVX     x86_64          <- inert on arm64
+  InstructionSetServicesAVX2    x86_64          <- inert on arm64
+  DecoderMetal                  x86_64 arm64    <- what arm64 loads
+  DecoderOpenCL                 x86_64 arm64
+```
+
+**B. A generic backend token** (`Cpu`, `Scalar`, `Generic`) **plus a prefix-sharing sibling with an arm64 slice** — evidence of a dispatch family where arm64 is served by another member:
+
+```
+libArriImageSdkTransformsCpu_module.9.0.1.so      x86_64          <- inert on arm64
+libArriImageSdkTransformsCpuFma_module.9.0.1.so   x86_64 arm64    <- what arm64 loads
+libArriImageSdkTransformsMetal_module.9.0.1.so    x86_64 arm64
+libArriImageSdkTransformsOpenCl_module.9.0.1.so   x86_64 arm64
+```
+
+Signal B alone is not enough: `InstructionSetServicesAVX` shares no name prefix with its universal alternatives, so prefix matching would miss the very case that motivates the rule.
+
+Keep both buckets visible — inert binaries still matter for bundle thinning — but keep them out of the Rosetta verdict. Stay conservative: over-reporting a Rosetta cost is a far safer error than hiding one. For DaVinci Resolve 21.0.4 this splits 36 Intel-only objects into 24 genuine, 11 inert, and 1 kext.
+
 ---
 
 ## Complete App Bundle Analysis Script
@@ -749,5 +818,5 @@ grep -RInE 'arch +(-arch +)?x86_64' /path/to/App.app
 
 ---
 
-**Last Updated:** 2026-05-31  
-**Version:** 1.3 (App bundle analysis: `analyze_app.sh` + recipes #027–#031; Stage 1 hardening #021–#025; Gatekeeper #012 + VirusTotal #013)
+**Last Updated:** 2026-09-07  
+**Version:** 1.4 (Staged prereq archives #032, Intel-only kexts #033, inert dispatch backends #034; App bundle analysis: `analyze_app.sh` + recipes #027–#031; Stage 1 hardening #021–#025; Gatekeeper #012 + VirusTotal #013)

@@ -98,17 +98,26 @@ Phases (top-to-bottom; the summary depends on state from earlier phases):
 5. **Payload extraction** — per-component, dispatching on format (gzip+cpio, raw
    cpio, xz, pbzx, nested xar, zip). Extraction exit codes are surfaced, never
    silenced — a silent failure would produce a wrong verdict.
-6. **Stub/downloader detection** — flags installers whose real payload is fetched
+6. **Staged prereq archives** — components that install nothing but drop a
+   `.tgz`/`.zip`/`.pkg` into `…/Prereqs/` for a postflight script are expanded in
+   place (recursively, with size and depth caps) so their contents reach the
+   sweep. `.dmg` is reported and skipped rather than auto-mounted. Archives that
+   could not be opened are called out above the verdict.
+7. **Stub/downloader detection** — flags installers whose real payload is fetched
    at install time (postflight runs `curl`/`wget`/`softwareupdate`/URLs and there
    are no on-disk binaries). These are marked **RESULT NON-COMPREHENSIVE**.
-7. **Per-app + recursive Mach-O sweep** — `lipo -archs`, `codesign`, `Info.plist`
-   on apps; Intel-only count across all Mach-O helpers.
-8. **Summary** — branches on stub status, extraction success, `Distribution`
-   presence, and arm64/arm64e equivalence to produce the verdict.
+8. **Per-app + recursive Mach-O sweep** — `lipo -archs`, `codesign`, `Info.plist`
+   on apps. Intel-only Mach-O is graded into three buckets rather than one count:
+   **kexts/dexts** (cannot run on Apple Silicon at all — Rosetta does not
+   translate drivers), **genuine Rosetta triggers**, and **inert** x86 dispatch
+   backends that arm64 never loads.
+9. **Summary** — leads with any Intel-only kext, then branches on stub status,
+   extraction success, `Distribution` presence, and arm64/arm64e equivalence.
 
 Hardening recipes behind this: **#021–#025** (payload dispatch, robust
 `hostArchitectures` parsing, recursive Mach-O walk + arm64e, component-vs-distribution
-branching, stub detection).
+branching, stub detection) and **#032–#034** (staged prereq archives, Intel-only
+kexts, inert dispatch backends).
 
 ---
 

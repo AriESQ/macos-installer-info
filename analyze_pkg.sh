@@ -169,6 +169,98 @@ postflight_has_network_primitive() {
         "$scripts_dir" 2>/dev/null | head -1
 }
 
+# Staged prereq archives.
+#
+# Some components install nothing directly; they drop an archive into
+# .../Prereqs/ for a postflight script to unpack later. The binaries inside are
+# invisible to the sweep below unless we expand them here, and they can hold the
+# most severe finding in the whole installer — DaVinci Resolve 21.0.4 stages a
+# zip whose only two Mach-O objects are Intel-only, one of them a kext.
+#
+# Expanded next to the archive as <archive>.expanded/ so everything lands under
+# $ANALYSIS_DIR and the existing sweep picks it up with no further plumbing.
+STAGED_EXPANDED=()      # archives expanded successfully
+STAGED_SKIPPED=()       # archives found but not expanded, with reason
+
+# Archives above this size are reported and skipped rather than expanded.
+MAX_STAGED_MB="${MAX_STAGED_MB:-2048}"
+STAGED_MAX_DEPTH=3      # archive → archive → archive; deep enough for real pkgs
+
+expand_staged_archive() {
+    # $1: archive path (relative to $ANALYSIS_DIR)  $2: component label
+    # $3: current depth
+    local archive="$1" component="$2" depth="$3"
+    local dest="${archive}.expanded"
+    local size_mb inner
+
+    size_mb=$(( $(stat -f%z "$archive" 2>/dev/null || echo 0) / 1048576 ))
+    if [ "$size_mb" -gt "$MAX_STAGED_MB" ]; then
+        STAGED_SKIPPED+=("$archive (${size_mb}MB exceeds ${MAX_STAGED_MB}MB cap — set MAX_STAGED_MB to override)")
+        return 1
+    fi
+
+    case "$archive" in
+        *.dmg)
+            # hdiutil attach mutates system state and can prompt for a licence
+            # agreement; refuse rather than surprise the user mid-analysis.
+            STAGED_SKIPPED+=("$archive (disk image — mount with 'hdiutil attach' and re-run against its contents)")
+            return 1
+            ;;
+        *.tgz|*.tar.gz|*.tar)
+            mkdir -p "$dest" || return 1
+            if ! tar xf "$archive" -C "$dest" 2>/dev/null; then
+                STAGED_SKIPPED+=("$archive (tar extraction failed)")
+                return 1
+            fi
+            ;;
+        *.zip)
+            mkdir -p "$dest" || return 1
+            if ! unzip -oq "$archive" -d "$dest" 2>/dev/null; then
+                STAGED_SKIPPED+=("$archive (unzip failed)")
+                return 1
+            fi
+            ;;
+        *.pkg)
+            # pkgutil insists on creating the destination itself.
+            if ! pkgutil --expand "$archive" "$dest" >/dev/null 2>&1; then
+                STAGED_SKIPPED+=("$archive (pkgutil --expand failed)")
+                return 1
+            fi
+            ;;
+        *)
+            STAGED_SKIPPED+=("$archive (unrecognised archive type)")
+            return 1
+            ;;
+    esac
+
+    STAGED_EXPANDED+=("$archive")
+
+    # A staged pkg has its own Payload (possibly several, one per component).
+    # Run them back through the same format dispatch used for the outer pkg.
+    while IFS= read -r inner; do
+        [ -f "$inner/Payload" ] || continue
+        ( cd "$inner" && extract_payload "$component → $(basename "$inner")" ) >/dev/null 2>&1 || true
+    done < <(
+        [ -f "$dest/Payload" ] && echo "$dest"
+        find "$dest" -maxdepth 2 -type d -name '*.pkg' 2>/dev/null
+    )
+
+    # Recurse: staged tarballs routinely contain a pkg, which contains a Payload.
+    expand_staged_tree "$dest" "$component" $((depth + 1))
+    return 0
+}
+
+expand_staged_tree() {
+    # $1: directory to scan  $2: component label  $3: current depth
+    local dir="$1" component="$2" depth="$3" archive
+    [ "$depth" -gt "$STAGED_MAX_DEPTH" ] && return 0
+    while IFS= read -r archive; do
+        expand_staged_archive "$archive" "$component" "$depth" || true
+    done < <(find "$dir" -type f \
+        \( -name '*.tgz' -o -name '*.tar.gz' -o -name '*.tar' \
+           -o -name '*.zip' -o -name '*.pkg' -o -name '*.dmg' \) 2>/dev/null)
+}
+
 echo "📦 Extracting payloads..."
 stage_start
 shopt -s nullglob
@@ -200,6 +292,25 @@ if [ ${#PAYLOAD_NOTES[@]} -gt 0 ]; then
     done
     echo ""
 fi
+
+# Expand staged prereq archives so their contents reach the sweep below.
+echo "🎁 Staged prereq archives:"
+stage_start
+for component in "${COMPONENTS[@]}"; do
+    expand_staged_tree "$component" "$component" 1
+done
+if [ ${#STAGED_EXPANDED[@]} -eq 0 ] && [ ${#STAGED_SKIPPED[@]} -eq 0 ]; then
+    echo "   (none found)"
+else
+    for a in "${STAGED_EXPANDED[@]}"; do
+        echo "   ✅ expanded: $a"
+    done
+    for a in "${STAGED_SKIPPED[@]}"; do
+        echo "   ⚠️  skipped:  $a"
+    done
+fi
+stage_end
+echo ""
 
 # Stub/downloader detection: component with no Payload extraction artifacts AND
 # postflight that calls network primitives.
@@ -258,6 +369,10 @@ MAIN_EXEC_HAS_NATIVE=false   # any main .app exec ships arm64/arm64e
 MAIN_EXEC_HAS_X86=false
 HELPER_INTEL_ONLY_COUNT=0    # count of Mach-O files (any kind) that are x86_64-only
 HELPER_INTEL_ONLY_LIST=()
+KEXT_INTEL_ONLY_LIST=()      # x86_64-only kexts/dexts — Rosetta cannot help these
+INERT_INTEL_LIST=()          # x86_64-only, but provably never loaded on arm64
+ROSETTA_INTEL_LIST=()        # x86_64-only and genuinely reachable → real Rosetta cost
+ARM_CAPABLE_LIST=()          # every Mach-O carrying an arm64 slice (sibling lookups)
 ANY_ARM64E=false
 
 while IFS= read -r app; do
@@ -333,11 +448,92 @@ for f in "${macho_paths[@]}"; do
     [ -z "$archs" ] && continue
     echo "$archs" | grep -qE '\barm64e\b' && ANY_ARM64E=true
     if echo "$archs" | grep -qE '\bx86_64\b' && ! echo "$archs" | grep -qE '\barm64(e)?\b'; then
-        HELPER_INTEL_ONLY_COUNT=$((HELPER_INTEL_ONLY_COUNT+1))
-        HELPER_INTEL_ONLY_LIST+=("${f#$ANALYSIS_DIR/}")
+        rel="${f#$ANALYSIS_DIR/}"
+        case "$rel" in
+            *.kext/*|*.dext/*)
+                # Rosetta 2 translates user-space processes only. An Intel-only
+                # kext or DriverKit driver cannot load on Apple Silicon at all,
+                # so it does not belong in the "Rosetta will be invoked" count.
+                KEXT_INTEL_ONLY_LIST+=("$rel")
+                ;;
+            *)
+                HELPER_INTEL_ONLY_LIST+=("$rel")
+                ;;
+        esac
+    elif echo "$archs" | grep -qE '\barm64(e)?\b'; then
+        ARM_CAPABLE_LIST+=("${f#$ANALYSIS_DIR/}")
     fi
 done
 
+# Separate genuine Rosetta triggers from x86-only code that arm64 never loads.
+#
+# An x86_64-only dylib cannot be dlopen'd by an arm64 process at all, so when a
+# library ships per-instruction-set backends and picks one at runtime, the x86
+# variants are dead weight on Apple Silicon rather than a Rosetta cost. Two
+# independent signals, because they catch different real-world layouts:
+#
+#   A. The name carries an x86-exclusive ISA (AVX, SSE, MMX). No arm64 build of
+#      such a backend can exist, so no sibling evidence is needed. This is what
+#      catches BlackmagicRawAPI's InstructionSetServicesAVX/AVX2, whose universal
+#      siblings (DecoderMetal, DecoderOpenCL) share no name prefix with it.
+#   B. The name carries a generic backend token (Cpu, Scalar, Generic) AND a
+#      same-directory sibling sharing its prefix has an arm64 slice — evidence of
+#      a dispatch family where arm64 is served by another member. This catches
+#      libArriImageSdkTransformsCpu_module alongside its CpuFma/Metal/OpenCl
+#      siblings.
+#
+# Deliberately conservative: anything not matching stays in the Rosetta count.
+# Over-reporting a Rosetta cost is a far safer error than hiding one.
+has_arm_sibling_with_prefix() {
+    # $1: directory (relative)  $2: required name prefix (>= 6 chars)
+    local dir="$1" prefix="$2" cand
+    [ ${#prefix} -ge 6 ] || return 1
+    for cand in "${ARM_CAPABLE_LIST[@]}"; do
+        [ "${cand%/*}" = "$dir" ] || continue
+        case "${cand##*/}" in
+            "$prefix"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+for rel in "${HELPER_INTEL_ONLY_LIST[@]}"; do
+    base="${rel##*/}"
+    dir="${rel%/*}"
+    reason=""
+    case "$base" in
+        *AVX*|*avx*|*SSE*|*sse*|*MMX*|*mmx*)
+            reason="x86-exclusive ISA in name; no arm64 build can exist"
+            ;;
+        *Cpu*|*CPU*|*Scalar*|*Generic*)
+            # Prefix = name up to the backend token, e.g.
+            # libArriImageSdkTransformsCpu_module -> libArriImageSdkTransforms
+            stem="$base"
+            for tok in Cpu CPU Scalar Generic; do
+                case "$stem" in *"$tok"*) stem="${stem%%"$tok"*}"; break ;; esac
+            done
+            if has_arm_sibling_with_prefix "$dir" "$stem"; then
+                reason="dispatch family; sibling ${stem}* carries arm64"
+            fi
+            ;;
+    esac
+    if [ -n "$reason" ]; then
+        INERT_INTEL_LIST+=("$rel  ($reason)")
+    else
+        HELPER_INTEL_ONLY_COUNT=$((HELPER_INTEL_ONLY_COUNT+1))
+        ROSETTA_INTEL_LIST+=("$rel")
+    fi
+done
+HELPER_INTEL_ONLY_LIST=("${ROSETTA_INTEL_LIST[@]}")
+
+if ((${#KEXT_INTEL_ONLY_LIST[@]} > 0)); then
+    echo "   🔴 Intel-only kernel extensions / DriverKit drivers: ${#KEXT_INTEL_ONLY_LIST[@]}"
+    printf '      - %s\n' "${KEXT_INTEL_ONLY_LIST[@]}"
+fi
+if ((${#INERT_INTEL_LIST[@]} > 0)); then
+    echo "   ℹ️  Intel-only but inert on arm64 (never loaded, no Rosetta cost): ${#INERT_INTEL_LIST[@]}"
+    printf '      - %s\n' "${INERT_INTEL_LIST[@]}"
+fi
 echo "   Intel-only Mach-O files (dylibs/XPC/helpers): $HELPER_INTEL_ONLY_COUNT"
 if ((${#HELPER_INTEL_ONLY_LIST[@]} > 0)); then
     printf '      - %s\n' "${HELPER_INTEL_ONLY_LIST[@]}"
@@ -351,6 +547,28 @@ echo ""
 echo "═══════════════════════════════════════════════════"
 echo "📊 Summary & Recommendations"
 echo "═══════════════════════════════════════════════════"
+
+# An Intel-only kext outranks everything else here: no Rosetta advice applies,
+# and the affected hardware simply does not work. Lead with it.
+if [ ${#KEXT_INTEL_ONLY_LIST[@]} -gt 0 ]; then
+    echo "🔴 INTEL-ONLY KERNEL EXTENSION(S) — CANNOT RUN ON APPLE SILICON"
+    for k in "${KEXT_INTEL_ONLY_LIST[@]}"; do echo "      - $k"; done
+    echo ""
+    echo "   Rosetta 2 translates user-space processes only; it does not translate"
+    echo "   kernel extensions or DriverKit drivers. Installing Rosetta will NOT help."
+    echo "   The associated hardware or feature is unusable on Apple Silicon until the"
+    echo "   vendor ships a native arm64 kext or a DriverKit .dext replacement."
+    echo ""
+fi
+
+# A staged archive we could not open is an unanalyzed corner of the installer.
+# Say so up front — the verdict below is silent about whatever is inside it.
+if [ ${#STAGED_SKIPPED[@]} -gt 0 ]; then
+    echo "⚠️  ${#STAGED_SKIPPED[@]} staged prereq archive(s) were NOT analyzed:"
+    for a in "${STAGED_SKIPPED[@]}"; do echo "      - $a"; done
+    echo "   The verdict below does not account for their contents."
+    echo ""
+fi
 
 # Branch 1: stub installer → result is non-comprehensive, refuse a clean verdict.
 if [ ${#STUB_COMPONENTS[@]} -gt 0 ]; then
