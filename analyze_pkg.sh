@@ -370,6 +370,9 @@ MAIN_EXEC_HAS_X86=false
 HELPER_INTEL_ONLY_COUNT=0    # count of Mach-O files (any kind) that are x86_64-only
 HELPER_INTEL_ONLY_LIST=()
 KEXT_INTEL_ONLY_LIST=()      # x86_64-only kexts/dexts — Rosetta cannot help these
+INERT_INTEL_LIST=()          # x86_64-only, but provably never loaded on arm64
+ROSETTA_INTEL_LIST=()        # x86_64-only and genuinely reachable → real Rosetta cost
+ARM_CAPABLE_LIST=()          # every Mach-O carrying an arm64 slice (sibling lookups)
 ANY_ARM64E=false
 
 while IFS= read -r app; do
@@ -454,16 +457,82 @@ for f in "${macho_paths[@]}"; do
                 KEXT_INTEL_ONLY_LIST+=("$rel")
                 ;;
             *)
-                HELPER_INTEL_ONLY_COUNT=$((HELPER_INTEL_ONLY_COUNT+1))
                 HELPER_INTEL_ONLY_LIST+=("$rel")
                 ;;
         esac
+    elif echo "$archs" | grep -qE '\barm64(e)?\b'; then
+        ARM_CAPABLE_LIST+=("${f#$ANALYSIS_DIR/}")
     fi
 done
+
+# Separate genuine Rosetta triggers from x86-only code that arm64 never loads.
+#
+# An x86_64-only dylib cannot be dlopen'd by an arm64 process at all, so when a
+# library ships per-instruction-set backends and picks one at runtime, the x86
+# variants are dead weight on Apple Silicon rather than a Rosetta cost. Two
+# independent signals, because they catch different real-world layouts:
+#
+#   A. The name carries an x86-exclusive ISA (AVX, SSE, MMX). No arm64 build of
+#      such a backend can exist, so no sibling evidence is needed. This is what
+#      catches BlackmagicRawAPI's InstructionSetServicesAVX/AVX2, whose universal
+#      siblings (DecoderMetal, DecoderOpenCL) share no name prefix with it.
+#   B. The name carries a generic backend token (Cpu, Scalar, Generic) AND a
+#      same-directory sibling sharing its prefix has an arm64 slice — evidence of
+#      a dispatch family where arm64 is served by another member. This catches
+#      libArriImageSdkTransformsCpu_module alongside its CpuFma/Metal/OpenCl
+#      siblings.
+#
+# Deliberately conservative: anything not matching stays in the Rosetta count.
+# Over-reporting a Rosetta cost is a far safer error than hiding one.
+has_arm_sibling_with_prefix() {
+    # $1: directory (relative)  $2: required name prefix (>= 6 chars)
+    local dir="$1" prefix="$2" cand
+    [ ${#prefix} -ge 6 ] || return 1
+    for cand in "${ARM_CAPABLE_LIST[@]}"; do
+        [ "${cand%/*}" = "$dir" ] || continue
+        case "${cand##*/}" in
+            "$prefix"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+for rel in "${HELPER_INTEL_ONLY_LIST[@]}"; do
+    base="${rel##*/}"
+    dir="${rel%/*}"
+    reason=""
+    case "$base" in
+        *AVX*|*avx*|*SSE*|*sse*|*MMX*|*mmx*)
+            reason="x86-exclusive ISA in name; no arm64 build can exist"
+            ;;
+        *Cpu*|*CPU*|*Scalar*|*Generic*)
+            # Prefix = name up to the backend token, e.g.
+            # libArriImageSdkTransformsCpu_module -> libArriImageSdkTransforms
+            stem="$base"
+            for tok in Cpu CPU Scalar Generic; do
+                case "$stem" in *"$tok"*) stem="${stem%%"$tok"*}"; break ;; esac
+            done
+            if has_arm_sibling_with_prefix "$dir" "$stem"; then
+                reason="dispatch family; sibling ${stem}* carries arm64"
+            fi
+            ;;
+    esac
+    if [ -n "$reason" ]; then
+        INERT_INTEL_LIST+=("$rel  ($reason)")
+    else
+        HELPER_INTEL_ONLY_COUNT=$((HELPER_INTEL_ONLY_COUNT+1))
+        ROSETTA_INTEL_LIST+=("$rel")
+    fi
+done
+HELPER_INTEL_ONLY_LIST=("${ROSETTA_INTEL_LIST[@]}")
 
 if ((${#KEXT_INTEL_ONLY_LIST[@]} > 0)); then
     echo "   🔴 Intel-only kernel extensions / DriverKit drivers: ${#KEXT_INTEL_ONLY_LIST[@]}"
     printf '      - %s\n' "${KEXT_INTEL_ONLY_LIST[@]}"
+fi
+if ((${#INERT_INTEL_LIST[@]} > 0)); then
+    echo "   ℹ️  Intel-only but inert on arm64 (never loaded, no Rosetta cost): ${#INERT_INTEL_LIST[@]}"
+    printf '      - %s\n' "${INERT_INTEL_LIST[@]}"
 fi
 echo "   Intel-only Mach-O files (dylibs/XPC/helpers): $HELPER_INTEL_ONLY_COUNT"
 if ((${#HELPER_INTEL_ONLY_LIST[@]} > 0)); then
